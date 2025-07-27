@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
 #include "exec/address-spaces.h"
 #include "exec/memattrs.h"
 #include "exec/memory.h"
@@ -61,6 +62,8 @@
 #include "hw/ssi/apple_spi.h"
 #include "hw/ssi/ssi.h"
 #include "hw/usb/apple_typec.h"
+#include "hw/virtio/virtio-mmio.h"
+#include "hw/virtio/virtio-serial.h"
 #include "hw/watchdog/apple_wdt.h"
 #include "qapi/visitor.h"
 #include "qemu/bswap.h"
@@ -105,6 +108,14 @@
 #define AMCC_LOWER(_p) (0x680 + (_p) * AMCC_PLANE_STRIDE)
 #define AMCC_UPPER(_p) (0x684 + (_p) * AMCC_PLANE_STRIDE)
 #define AMCC_REG(_tms, _x) *(uint32_t *)(&t8030_machine->amcc_reg[_x])
+
+static char *hostlink_get_bus(Object *obj, Error **errp);
+static hwaddr t8030_find_free_mmio(const T8030MachineState *m);
+static uint32_t t8030_find_unused_irq(const T8030MachineState *m);
+
+static uint64_t hostlink_mmio;
+static uint32_t hostlink_irq;
+static char hostlink_bus[64];
 
 static size_t t8030_real_cpu_count(T8030MachineState *t8030_machine)
 {
@@ -2620,6 +2631,109 @@ static void t8030_create_audio_speaker_bottom(T8030MachineState *t8030_machine)
     device = ssi_create_peripheral(apple_spi_get_bus(spi), TYPE_APPLE_CS42L77);
 }
 
+static void t8030_create_hostlink(T8030MachineState *m)
+{
+    hwaddr base;
+    uint32_t irq;
+    DeviceState *vmmio_dev;
+    SysBusDevice *vmmio;
+    DeviceState *vserial;
+    Object *o;
+
+    base = t8030_find_free_mmio(m);
+    irq = t8030_find_unused_irq(m);
+
+    vmmio_dev = qdev_new(TYPE_VIRTIO_MMIO);
+    qdev_prop_set_bit(vmmio_dev, "force-legacy", false);
+    qdev_prop_set_bit(vmmio_dev, "ioeventfd", false);
+
+    vmmio = SYS_BUS_DEVICE(vmmio_dev);
+    sysbus_realize_and_unref(vmmio, &error_fatal);
+    sysbus_mmio_map(vmmio, 0, base);
+    sysbus_connect_irq(vmmio, 0, qdev_get_gpio_in(DEVICE(m->aic), irq));
+
+    vserial = qdev_new(TYPE_VIRTIO_SERIAL);
+    qdev_prop_set_uint32(vserial, "max_ports", 2);
+    qdev_realize_and_unref(vserial, QLIST_FIRST(&vmmio_dev->child_bus),
+                           &error_fatal);
+
+    hostlink_mmio = base;
+    hostlink_irq = irq;
+    pstrcpy(hostlink_bus, sizeof(hostlink_bus),
+            QLIST_FIRST(&vserial->child_bus)->name);
+
+    o = OBJECT(m);
+    object_property_add_uint64_ptr(o, "hostlink-mmio", &hostlink_mmio,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint32_ptr(o, "hostlink-irq", &hostlink_irq,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_str(o, "hostlink-bus", hostlink_get_bus, NULL);
+}
+
+static char *hostlink_get_bus(Object *obj, Error **errp)
+{
+    return g_strdup(hostlink_bus);
+}
+
+static hwaddr t8030_find_free_mmio(const T8030MachineState *m)
+{
+    const gsize page_size = 0x4000;
+    const hwaddr win_lo = QEMU_ALIGN_UP(m->soc_base_pa, page_size);
+    const hwaddr win_hi = QEMU_ALIGN_DOWN(m->soc_base_pa + m->soc_size,
+                                          page_size);
+    MemoryRegion *sysmem = address_space_memory.root;
+    hwaddr pa = win_lo;
+
+    while (pa + page_size <= win_hi) {
+        MemoryRegionSection mrs = memory_region_find(sysmem, pa, page_size);
+
+        if (mrs.mr == NULL || mrs.mr->ops == NULL) {
+            return pa;
+        }
+
+        pa = QEMU_ALIGN_UP(mrs.offset_within_address_space + mrs.size,
+                           page_size);
+    }
+
+    g_assert_not_reached();
+}
+
+static uint32_t t8030_find_unused_irq(const T8030MachineState *m)
+{
+    GQueue q = G_QUEUE_INIT;
+    DTBNode *node;
+    bool used[576] = { false }; /* AIC has 576 lines */
+
+    g_queue_push_tail(&q, dtb_get_node(m->device_tree, "/"));
+    while ((node = g_queue_pop_head(&q)) != NULL) {
+        DTBProp *prop;
+
+        prop = dtb_find_prop(node, "interrupts");
+        if (prop != NULL) {
+            uint32_t *ints = (uint32_t *)prop->data;
+
+            for (int i = 0; i < prop->length / sizeof(uint32_t); i++) {
+                uint32_t irq = ints[i];
+                if (irq < G_N_ELEMENTS(used)) {
+                    used[irq] = true;
+                }
+            }
+        }
+
+        for (GList *c = node->children; c; c = c->next) {
+            g_queue_push_tail(&q, c->data);
+        }
+    }
+
+    for (int spi = 32; spi != G_N_ELEMENTS(used); spi++) { /* Skip SGIs/PPIs */
+        if (!used[spi]) {
+            return spi;
+        }
+    }
+
+    g_assert_not_reached();
+}
+
 static void t8030_cpu_reset_work(CPUState *cpu, run_on_cpu_data data)
 {
     T8030MachineState *t8030_machine;
@@ -2942,6 +3056,8 @@ static void t8030_machine_init(MachineState *machine)
     t8030_create_mca(t8030_machine);
     t8030_create_audio_speaker_top(t8030_machine);
     t8030_create_audio_speaker_bottom(t8030_machine);
+
+    t8030_create_hostlink(t8030_machine);
 
     t8030_machine->init_done_notifier.notify = t8030_machine_init_done;
     qemu_add_machine_init_done_notifier(&t8030_machine->init_done_notifier);
